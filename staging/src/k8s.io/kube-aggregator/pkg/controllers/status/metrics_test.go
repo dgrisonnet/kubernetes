@@ -20,43 +20,17 @@ import (
 	"strings"
 	"testing"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/component-base/metrics/testutil"
-	apiregistration "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
-	listers "k8s.io/kube-aggregator/pkg/client/listers/apiregistration/v1"
 )
 
 func TestAPIServiceAvailabilityCollection(t *testing.T) {
-	apiServiceIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
-	collector := newAPIServiceStatusCollector(listers.NewAPIServiceLister(apiServiceIndexer))
+	collector := newAvailabilityCollector()
 
-	availableAPIService := &apiregistration.APIService{
-		ObjectMeta: metav1.ObjectMeta{Name: "available"},
-		Status: apiregistration.APIServiceStatus{
-			Conditions: []apiregistration.APIServiceCondition{
-				{
-					Type:   apiregistration.Available,
-					Status: apiregistration.ConditionTrue,
-				},
-			},
-		},
-	}
+	availableAPIService := "available"
+	unavailableAPIService := "unavailable"
 
-	unavailableAPIService := &apiregistration.APIService{
-		ObjectMeta: metav1.ObjectMeta{Name: "unavailable"},
-		Status: apiregistration.APIServiceStatus{
-			Conditions: []apiregistration.APIServiceCondition{
-				{
-					Type:   apiregistration.Available,
-					Status: apiregistration.ConditionFalse,
-				},
-			},
-		},
-	}
-
-	apiServiceIndexer.Add(availableAPIService)
-	apiServiceIndexer.Add(unavailableAPIService)
+	collector.SetAPIServiceAvailable(availableAPIService)
+	collector.SetAPIServiceUnavailable(unavailableAPIService)
 
 	err := testutil.CustomCollectAndCompare(collector, strings.NewReader(`
 	# HELP aggregator_unavailable_apiservice [ALPHA] Gauge of APIServices which are marked as unavailable broken down by APIService name.
@@ -70,8 +44,8 @@ func TestAPIServiceAvailabilityCollection(t *testing.T) {
 
 	collector.ClearState()
 
-	apiServiceIndexer.Delete(availableAPIService)
-	apiServiceIndexer.Delete(unavailableAPIService)
+	collector.ForgetAPIService(availableAPIService)
+	collector.ForgetAPIService(unavailableAPIService)
 
 	err = testutil.CustomCollectAndCompare(collector, strings.NewReader(`
 	# HELP aggregator_unavailable_apiservice [ALPHA] Gauge of APIServices which are marked as unavailable broken down by APIService name.

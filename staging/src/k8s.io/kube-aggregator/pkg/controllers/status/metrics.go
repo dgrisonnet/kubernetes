@@ -19,12 +19,7 @@ package apiserver
 import (
 	"sync"
 
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/component-base/metrics"
-	"k8s.io/component-base/metrics/legacyregistry"
-	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
-	apiregistrationv1apihelper "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1/helper"
-	listers "k8s.io/kube-aggregator/pkg/client/listers/apiregistration/v1"
 )
 
 /*
@@ -36,15 +31,6 @@ import (
  * the metric stability policy.
  */
 var (
-	unavailableCounter = metrics.NewCounterVec(
-		&metrics.CounterOpts{
-			Name:           "aggregator_unavailable_apiservice_total",
-			Help:           "Counter of APIServices which are marked as unavailable broken down by APIService name and reason.",
-			StabilityLevel: metrics.ALPHA,
-		},
-		[]string{"name", "reason"},
-	)
-
 	unavailableGaugeDesc = metrics.NewDesc(
 		"aggregator_unavailable_apiservice",
 		"Gauge of APIServices which are marked as unavailable broken down by APIService name.",
@@ -54,55 +40,116 @@ var (
 		"",
 	)
 )
-var registerMetrics sync.Once
 
-// Register registers metrics for status controller.
-func Register(apiServiceLister listers.APIServiceLister) {
-	registerMetrics.Do(func() {
-		legacyregistry.CustomMustRegister(newAPIServiceStatusCollector(apiServiceLister))
-		legacyregistry.MustRegister(unavailableCounter)
-	})
+type availabilityMetrics struct {
+	unavailableCounter *metrics.CounterVec
+
+	*availabilityCollector
 }
 
-type apiServiceStatusCollector struct {
+func newAvailabilityMetrics() *availabilityMetrics {
+	return &availabilityMetrics{
+		unavailableCounter: metrics.NewCounterVec(
+			&metrics.CounterOpts{
+				Name:           "aggregator_unavailable_apiservice_total",
+				Help:           "Counter of APIServices which are marked as unavailable broken down by APIService name and reason.",
+				StabilityLevel: metrics.ALPHA,
+			},
+			[]string{"name", "reason"},
+		),
+		availabilityCollector: newAvailabilityCollector(),
+	}
+}
+
+// Register registers apiservice availability metrics.
+func (m *availabilityMetrics) Register(
+	registrationFunc func(metrics.Registerable) error,
+	customRegistrationFunc func(metrics.StableCollector) error,
+) error {
+	err := registrationFunc(m.unavailableCounter)
+	if err != nil {
+		return err
+	}
+
+	err = customRegistrationFunc(m.availabilityCollector)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// UnavailableCounter returns a counter to track apiservices marked as unavailable.
+func (m *availabilityMetrics) UnavailableCounter(apiServiceName, reason string) metrics.CounterMetric {
+	return m.unavailableCounter.WithLabelValues(apiServiceName, reason)
+}
+
+type availabilityCollector struct {
 	metrics.BaseStableCollector
 
-	apiServiceLister listers.APIServiceLister
+	mtx            sync.RWMutex
+	availabilities map[string]bool
 }
 
 // Check if apiServiceStatusCollector implements necessary interface.
-var _ metrics.StableCollector = &apiServiceStatusCollector{}
+var _ metrics.StableCollector = &availabilityCollector{}
 
-func newAPIServiceStatusCollector(apiServiceLister listers.APIServiceLister) *apiServiceStatusCollector {
-	return &apiServiceStatusCollector{
-		apiServiceLister: apiServiceLister,
+func newAvailabilityCollector() *availabilityCollector {
+	return &availabilityCollector{
+		availabilities: make(map[string]bool),
 	}
 }
 
 // DescribeWithStability implements the metrics.StableCollector interface.
-func (c *apiServiceStatusCollector) DescribeWithStability(ch chan<- *metrics.Desc) {
+func (c *availabilityCollector) DescribeWithStability(ch chan<- *metrics.Desc) {
 	ch <- unavailableGaugeDesc
 }
 
 // CollectWithStability implements the metrics.StableCollector interface.
-func (c *apiServiceStatusCollector) CollectWithStability(ch chan<- metrics.Metric) {
-	apiServiceList, _ := c.apiServiceLister.List(labels.Everything())
-	for _, apiService := range apiServiceList {
-		isAvailable := apiregistrationv1apihelper.IsAPIServiceConditionTrue(apiService, apiregistrationv1.Available)
+func (c *availabilityCollector) CollectWithStability(ch chan<- metrics.Metric) {
+	c.mtx.RLock()
+	defer c.mtx.RUnlock()
+
+	for apiServiceName, isAvailable := range c.availabilities {
 		if isAvailable {
 			ch <- metrics.NewLazyConstMetric(
 				unavailableGaugeDesc,
 				metrics.GaugeValue,
 				0.0,
-				apiService.Name,
+				apiServiceName,
 			)
 		} else {
 			ch <- metrics.NewLazyConstMetric(
 				unavailableGaugeDesc,
 				metrics.GaugeValue,
 				1.0,
-				apiService.Name,
+				apiServiceName,
 			)
 		}
 	}
+}
+
+// SetAPIServiceAvailable sets the given apiservice availability gauge to available.
+func (c *availabilityCollector) SetAPIServiceAvailable(apiServiceKey string) {
+	c.setAPIServiceAvailability(apiServiceKey, true)
+}
+
+// SetAPIServiceUnavailable sets the given apiservice availability gauge to unavailable.
+func (c *availabilityCollector) SetAPIServiceUnavailable(apiServiceKey string) {
+	c.setAPIServiceAvailability(apiServiceKey, false)
+}
+
+func (c *availabilityCollector) setAPIServiceAvailability(apiServiceKey string, availability bool) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
+	c.availabilities[apiServiceKey] = availability
+}
+
+// ForgetAPIService removes the availability gauge of the given apiservice.
+func (c *availabilityCollector) ForgetAPIService(apiServiceKey string) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
+	delete(c.availabilities, apiServiceKey)
 }
