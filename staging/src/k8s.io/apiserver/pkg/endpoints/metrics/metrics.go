@@ -35,6 +35,7 @@ import (
 	"k8s.io/apiserver/pkg/endpoints/responsewriter"
 	compbasemetrics "k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
+	"k8s.io/klog/v2"
 )
 
 // resettableCollector is the interface implemented by prometheus.MetricVec
@@ -533,6 +534,7 @@ func MonitorRequest(req *http.Request, verb, group, version, resource, subresour
 		apiSelfRequestCounter.WithContext(req.Context()).WithLabelValues(reportedVerb, resource, subresource).Inc()
 	}
 	if deprecated {
+		klog.Info("Monitored deprecated request: group: %v, version: %v, resource: %v, subresource: %v, removedRelease: %v", group, version, resource, subresource, removedRelease)
 		deprecatedRequestGauge.WithContext(req.Context()).WithLabelValues(group, version, resource, subresource, removedRelease).Set(1)
 		audit.AddAuditAnnotation(req.Context(), deprecatedAnnotationKey, "true")
 		if len(removedRelease) > 0 {
