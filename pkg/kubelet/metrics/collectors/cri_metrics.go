@@ -19,6 +19,7 @@ package collectors
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"k8s.io/component-base/metrics"
@@ -32,13 +33,19 @@ type criMetricsCollector struct {
 	// They will be saved in this map, where the key is the Name and the value is the Desc.
 	descriptors             map[string]*metrics.Desc
 	listPodSandboxMetricsFn func(context.Context) ([]*runtimeapi.PodSandboxMetrics, error)
+
+	mu               sync.Mutex
+	cachedPodMetrics []*runtimeapi.PodSandboxMetrics
 }
 
 // Check if criMetricsCollector implements necessary interface
 var _ metrics.StableCollector = &criMetricsCollector{}
 
-// NewCRIMetricsCollector implements the metrics.Collector interface
-func NewCRIMetricsCollector(ctx context.Context, listPodSandboxMetricsFn func(context.Context) ([]*runtimeapi.PodSandboxMetrics, error), listMetricDescriptorsFn func(context.Context) ([]*runtimeapi.MetricDescriptor, error)) metrics.StableCollector {
+// NewCRIMetricsCollector implements the metrics.Collector interface.
+// A background goroutine collects metrics from the runtime every collectionPeriod
+// and caches them. Scrapes serve the cached result without blocking on gRPC.
+// The goroutine runs until ctx is canceled.
+func NewCRIMetricsCollector(ctx context.Context, listPodSandboxMetricsFn func(context.Context) ([]*runtimeapi.PodSandboxMetrics, error), listMetricDescriptorsFn func(context.Context) ([]*runtimeapi.MetricDescriptor, error), collectionPeriod time.Duration) metrics.StableCollector {
 	descs, err := listMetricDescriptorsFn(ctx)
 	if err != nil {
 		logger := klog.FromContext(ctx)
@@ -56,6 +63,8 @@ func NewCRIMetricsCollector(ctx context.Context, listPodSandboxMetricsFn func(co
 		c.descriptors[desc.Name] = criDescToProm(desc)
 	}
 
+	go c.collectLoop(ctx, collectionPeriod)
+
 	return c
 }
 
@@ -66,19 +75,15 @@ func (c *criMetricsCollector) DescribeWithStability(ch chan<- *metrics.Desc) {
 	}
 }
 
-// Collect implements the metrics.CollectWithStability interface.
-// TODO(haircommander): would it be better if these were processed async?
+// CollectWithStability converts cached CRI data to Prometheus metrics on each
+// scrape. This keeps memory low by storing only the raw protobuf data between
+// scrapes, at the cost of per-scrape conversion work.
 func (c *criMetricsCollector) CollectWithStability(ch chan<- metrics.Metric) {
-	// Use context.TODO() because we currently do not have a proper context to pass in.
-	// Replace this with an appropriate context when refactoring this function to accept a context parameter.
-	ctx := context.TODO()
-	logger := klog.FromContext(ctx)
-	podMetrics, err := c.listPodSandboxMetricsFn(ctx)
-	if err != nil {
-		logger.Error(err, "Failed to get pod metrics")
-		return
-	}
+	c.mu.Lock()
+	podMetrics := c.cachedPodMetrics
+	c.mu.Unlock()
 
+	logger := klog.TODO()
 	for _, podMetric := range podMetrics {
 		for _, metric := range podMetric.GetMetrics() {
 			promMetric, err := c.criMetricToProm(logger, metric)
@@ -95,6 +100,38 @@ func (c *criMetricsCollector) CollectWithStability(ch chan<- metrics.Metric) {
 			}
 		}
 	}
+}
+
+// collectLoop runs collect immediately, then every collectionPeriod until ctx
+// is canceled.
+func (c *criMetricsCollector) collectLoop(ctx context.Context, collectionPeriod time.Duration) {
+	c.collect(ctx)
+	ticker := time.NewTicker(collectionPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.collect(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// collect fetches metrics from the runtime via gRPC and stores the raw CRI
+// data. Conversion to Prometheus format happens at scrape time in
+// CollectWithStability.
+func (c *criMetricsCollector) collect(ctx context.Context) {
+	logger := klog.FromContext(ctx)
+	podMetrics, err := c.listPodSandboxMetricsFn(ctx)
+	if err != nil {
+		logger.Error(err, "Failed to get pod metrics")
+		return
+	}
+
+	c.mu.Lock()
+	c.cachedPodMetrics = podMetrics
+	c.mu.Unlock()
 }
 
 func criDescToProm(m *runtimeapi.MetricDescriptor) *metrics.Desc {
