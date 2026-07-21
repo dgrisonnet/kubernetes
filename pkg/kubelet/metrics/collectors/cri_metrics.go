@@ -26,6 +26,10 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// kubernetesLabelKeys are the Kubernetes-level labels appended to every CRI metric
+// to match the labels produced by the cadvisor metrics path.
+var kubernetesLabelKeys = []string{"namespace", "pod", "container"}
+
 type criMetricsCollector struct {
 	metrics.BaseStableCollector
 	// The descriptors structure will be populated by one call to ListMetricDescriptors from the runtime.
@@ -80,15 +84,18 @@ func (c *criMetricsCollector) CollectWithStability(ch chan<- metrics.Metric) {
 	}
 
 	for _, podMetric := range podMetrics {
+		podName, namespace := podSandboxLabels(podMetric.GetMetadata())
+
 		for _, metric := range podMetric.GetMetrics() {
-			promMetric, err := c.criMetricToProm(logger, metric)
+			promMetric, err := c.criMetricToProm(logger, metric, namespace, podName, "POD")
 			if err == nil {
 				ch <- promMetric
 			}
 		}
 		for _, ctrMetric := range podMetric.GetContainerMetrics() {
+			containerName := containerLabel(ctrMetric.GetMetadata())
 			for _, metric := range ctrMetric.GetMetrics() {
-				promMetric, err := c.criMetricToProm(logger, metric)
+				promMetric, err := c.criMetricToProm(logger, metric, namespace, podName, containerName)
 				if err == nil {
 					ch <- promMetric
 				}
@@ -100,10 +107,15 @@ func (c *criMetricsCollector) CollectWithStability(ch chan<- metrics.Metric) {
 func criDescToProm(m *runtimeapi.MetricDescriptor) *metrics.Desc {
 	// Labels in the translation are variableLabels, as opposed to constant labels.
 	// This is because the values of the labels will be different for each container.
-	return metrics.NewDesc(m.Name, m.Help, m.LabelKeys, nil, metrics.INTERNAL, "")
+	// Append Kubernetes-level labels (namespace, pod, container) that the CRI runtime
+	// does not provide but that consumers expect on /metrics/cadvisor.
+	labelKeys := make([]string, 0, len(m.LabelKeys)+len(kubernetesLabelKeys))
+	labelKeys = append(labelKeys, m.LabelKeys...)
+	labelKeys = append(labelKeys, kubernetesLabelKeys...)
+	return metrics.NewDesc(m.Name, m.Help, labelKeys, nil, metrics.INTERNAL, "")
 }
 
-func (c *criMetricsCollector) criMetricToProm(logger klog.Logger, m *runtimeapi.Metric) (metrics.Metric, error) {
+func (c *criMetricsCollector) criMetricToProm(logger klog.Logger, m *runtimeapi.Metric, namespace, podName, containerName string) (metrics.Metric, error) {
 	desc, ok := c.descriptors[m.Name]
 	if !ok {
 		err := fmt.Errorf("error converting CRI Metric to prometheus format")
@@ -113,7 +125,11 @@ func (c *criMetricsCollector) criMetricToProm(logger klog.Logger, m *runtimeapi.
 
 	typ := criTypeToProm[m.MetricType]
 
-	pm, err := metrics.NewConstMetric(desc, typ, float64(m.GetValue().Value), m.LabelValues...)
+	labelValues := make([]string, 0, len(m.LabelValues)+len(kubernetesLabelKeys))
+	labelValues = append(labelValues, m.LabelValues...)
+	labelValues = append(labelValues, namespace, podName, containerName)
+
+	pm, err := metrics.NewConstMetric(desc, typ, float64(m.GetValue().Value), labelValues...)
 	if err != nil {
 		logger.Error(err, "Error getting CRI prometheus metric", "descriptor", desc.String())
 		return nil, err
@@ -126,6 +142,20 @@ func (c *criMetricsCollector) criMetricToProm(logger klog.Logger, m *runtimeapi.
 		return pm, nil
 	}
 	return metrics.NewLazyMetricWithTimestamp(time.Unix(0, m.Timestamp), pm), nil
+}
+
+func podSandboxLabels(metadata *runtimeapi.PodSandboxMetadata) (podName, namespace string) {
+	if metadata != nil {
+		return metadata.Name, metadata.Namespace
+	}
+	return "", ""
+}
+
+func containerLabel(metadata *runtimeapi.ContainerMetadata) string {
+	if metadata != nil {
+		return metadata.Name
+	}
+	return ""
 }
 
 var criTypeToProm = map[runtimeapi.MetricType]metrics.ValueType{

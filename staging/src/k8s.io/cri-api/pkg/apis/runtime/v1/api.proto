@@ -2214,11 +2214,13 @@ message PodSandboxMetrics {
     string pod_sandbox_id = 1;
     repeated Metric metrics = 2;
     repeated ContainerMetrics container_metrics = 3;
+    PodSandboxMetadata metadata = 4;
 }
 
 message ContainerMetrics {
     string container_id = 1;
     repeated Metric metrics = 2;
+    ContainerMetadata metadata = 3;
 }
 
 message Metric {
