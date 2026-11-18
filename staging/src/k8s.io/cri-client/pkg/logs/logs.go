@@ -213,6 +213,10 @@ type logWriter struct {
 	stderr io.Writer
 	opts   *LogOptions
 	remain int64
+	// partials buffers the fragments of lines split across several log
+	// records, per stream, so that a record from the other stream is not
+	// written into the middle of such a line.
+	partials map[runtimeapi.LogStreamType]*logMessage
 }
 
 // errMaximumWrite is returned when all bytes have been written.
@@ -223,10 +227,11 @@ var errShortWrite = errors.New("short write")
 
 func newLogWriter(stdout io.Writer, stderr io.Writer, opts *LogOptions) *logWriter {
 	w := &logWriter{
-		stdout: stdout,
-		stderr: stderr,
-		opts:   opts,
-		remain: math.MaxInt64, // initialize it as infinity
+		stdout:   stdout,
+		stderr:   stderr,
+		opts:     opts,
+		remain:   math.MaxInt64, // initialize it as infinity
+		partials: map[runtimeapi.LogStreamType]*logMessage{},
 	}
 	if opts.LimitBytes != nil {
 		w.remain = *opts.LimitBytes
@@ -234,35 +239,67 @@ func newLogWriter(stdout io.Writer, stderr io.Writer, opts *LogOptions) *logWrit
 	return w
 }
 
-// writeLogs writes logs into stdout, stderr.
-func (w *logWriter) write(msg *logMessage, addPrefix bool) error {
+// streamFor returns the writer for the given stream type.
+func (w *logWriter) streamFor(streamType runtimeapi.LogStreamType) (io.Writer, error) {
+	switch streamType {
+	case runtimeapi.Stdout:
+		return w.stdout, nil
+	case runtimeapi.Stderr:
+		return w.stderr, nil
+	default:
+		return nil, fmt.Errorf("unexpected stream type %q", streamType)
+	}
+}
+
+// write writes a log message into stdout or stderr.
+// A record whose content does not end with a newline is a fragment of a
+// line split across records (CRI P tag, or a runtime log buffer boundary);
+// fragments are buffered per stream until the terminating record arrives.
+func (w *logWriter) write(msg *logMessage) error {
 	if msg.timestamp.Before(w.opts.Since) {
 		// Skip the line because it's older than since
 		return nil
 	}
+	stream, err := w.streamFor(msg.stream)
+	if err != nil {
+		return err
+	}
+	// Since v1.32, either w.stdout or w.stderr may be nil if the stream is not requested.
+	// In such case, we should neither count the bytes nor write to the stream.
+	if stream == nil {
+		return nil
+	}
+	complete := len(msg.log) > 0 && msg.log[len(msg.log)-1] == eol[0]
+	if pending := w.partials[msg.stream]; pending != nil {
+		pending.log = append(pending.log, msg.log...)
+		msg = pending
+		if !complete {
+			return nil
+		}
+		delete(w.partials, msg.stream)
+	} else if !complete {
+		// Copy the fragment: msg.log may alias the log reader's buffer,
+		// which is reused for the next record.
+		w.partials[msg.stream] = &logMessage{
+			timestamp: msg.timestamp,
+			stream:    msg.stream,
+			log:       bytes.Clone(msg.log),
+		}
+		return nil
+	}
+	return w.emit(msg, stream)
+}
+
+// emit writes one complete log line to its stream.
+func (w *logWriter) emit(msg *logMessage, stream io.Writer) error {
 	line := msg.log
-	if w.opts.Timestamp && addPrefix {
+	if w.opts.Timestamp {
 		prefix := append([]byte(msg.timestamp.Format(timeFormatOut)), delimiter[0])
 		line = append(prefix, line...)
 	}
 	// If the line is longer than the remaining bytes, cut it.
 	if int64(len(line)) > w.remain {
 		line = line[:w.remain]
-	}
-	// Get the proper stream to write to.
-	var stream io.Writer
-	switch msg.stream {
-	case runtimeapi.Stdout:
-		stream = w.stdout
-	case runtimeapi.Stderr:
-		stream = w.stderr
-	default:
-		return fmt.Errorf("unexpected stream type %q", msg.stream)
-	}
-	// Since v1.32, either w.stdout or w.stderr may be nil if the stream is not requested.
-	// In such case, we should neither count the bytes nor write to the stream.
-	if stream == nil {
-		return nil
 	}
 	n, err := stream.Write(line)
 	w.remain -= int64(n)
@@ -276,6 +313,27 @@ func (w *logWriter) write(msg *logMessage, addPrefix bool) error {
 	// If there are no more bytes left, return errMaximumWrite
 	if w.remain <= 0 {
 		return errMaximumWrite
+	}
+	return nil
+}
+
+// flush writes buffered line fragments that never saw a terminating
+// record, so they are not lost when reading ends. Hitting the byte limit
+// is not an error here.
+func (w *logWriter) flush() error {
+	for _, streamType := range []runtimeapi.LogStreamType{runtimeapi.Stdout, runtimeapi.Stderr} {
+		msg := w.partials[streamType]
+		if msg == nil {
+			continue
+		}
+		delete(w.partials, streamType)
+		stream, err := w.streamFor(streamType)
+		if err != nil {
+			return err
+		}
+		if err := w.emit(msg, stream); err != nil && !errors.Is(err, errMaximumWrite) {
+			return err
+		}
 	}
 	return nil
 }
@@ -321,7 +379,6 @@ func ReadLogs(ctx context.Context, path, containerID string, opts *LogOptions, r
 	var watcher *fsnotify.Watcher
 	var parse parseFunc
 	var stop bool
-	isNewLine := true
 	found := true
 	writer := newLogWriter(stdout, stderr, opts)
 	msg := &logMessage{}
@@ -332,7 +389,7 @@ func ReadLogs(ctx context.Context, path, containerID string, opts *LogOptions, r
 	for {
 		if stop || (limitedMode && limitedNum == 0) {
 			logger.V(2).Info("Finished parsing log file", "path", path)
-			return nil
+			return writer.flush()
 		}
 		l, err := r.ReadBytes(eol[0])
 		if err != nil {
@@ -342,7 +399,7 @@ func ReadLogs(ctx context.Context, path, containerID string, opts *LogOptions, r
 			if opts.Follow {
 				// The container is not running, we got to the end of the log.
 				if !found {
-					return nil
+					return writer.flush()
 				}
 				// Reset seek so that if this is an incomplete line,
 				// it will be read again.
@@ -405,8 +462,8 @@ func ReadLogs(ctx context.Context, path, containerID string, opts *LogOptions, r
 			continue
 		}
 		// Write the log line into the stream.
-		if err := writer.write(msg, isNewLine); err != nil {
-			if err == errMaximumWrite {
+		if err := writer.write(msg); err != nil {
+			if errors.Is(err, errMaximumWrite) {
 				var bytes int64 = -1
 				if opts.LimitBytes != nil {
 					bytes = *opts.LimitBytes
@@ -419,11 +476,6 @@ func ReadLogs(ctx context.Context, path, containerID string, opts *LogOptions, r
 		}
 		if limitedMode {
 			limitedNum--
-		}
-		if len(msg.log) > 0 {
-			isNewLine = msg.log[len(msg.log)-1] == eol[0]
-		} else {
-			isNewLine = true
 		}
 	}
 }

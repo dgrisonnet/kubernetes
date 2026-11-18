@@ -177,6 +177,146 @@ func TestReadLogs(t *testing.T) {
 	}
 }
 
+func TestReadLogsInterleavedPartialLines(t *testing.T) {
+	file, err := os.CreateTemp("", "TestReadLogsInterleavedPartialLines")
+	if err != nil {
+		t.Fatalf("unable to create temp file")
+	}
+	t.Cleanup(func() {
+		if err := file.Close(); err != nil {
+			t.Logf("failed to close file: %v", err)
+		}
+		if err := os.Remove(file.Name()); err != nil {
+			t.Logf("failed to remove file: %v", err)
+		}
+	})
+	// A stdout line split into two records (P then F) by the runtime's
+	// fixed-size read buffer, with a complete stderr line written in
+	// between.
+	file.WriteString("2026-10-01T14:27:54.313682300+00:00 stdout P stdout partial\n")
+	file.WriteString("2026-10-01T14:27:54.814408510+00:00 stderr F stderr full\n")
+	file.WriteString("2026-10-01T14:27:55.314972418+00:00 stdout F stdout end\n")
+
+	testCases := []struct {
+		name     string
+		opts     LogOptions
+		expected string
+	}{
+		{
+			name:     "without timestamps",
+			opts:     LogOptions{},
+			expected: "stderr full\nstdout partialstdout end\n",
+		},
+		{
+			name: "with timestamps",
+			opts: LogOptions{Timestamp: true},
+			expected: "2026-10-01T14:27:54.814408510Z stderr full\n" +
+				"2026-10-01T14:27:54.313682300Z stdout partialstdout end\n",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			containerID := "fake-container-id"
+			fakeRuntimeService := &apitesting.FakeRuntimeService{
+				Containers: map[string]*apitesting.FakeContainer{
+					containerID: {
+						ContainerStatus: runtimeapi.ContainerStatus{
+							State: runtimeapi.ContainerState_CONTAINER_RUNNING,
+						},
+					},
+				},
+			}
+			// Both streams share one writer, like pod log requests
+			// without a stream filter.
+			buf := bytes.NewBuffer(nil)
+			err := ReadLogs(context.TODO(), file.Name(), containerID, &tc.opts, fakeRuntimeService, buf, buf)
+			if err != nil {
+				t.Fatal(err.Error())
+			}
+			if actual := buf.String(); tc.expected != actual {
+				t.Fatalf("Actual output does not match expected.\nActual:  %v\nExpected: %v\n", actual, tc.expected)
+			}
+		})
+	}
+}
+
+func TestReadLogsFlushesUnterminatedPartialLine(t *testing.T) {
+	file, err := os.CreateTemp("", "TestReadLogsFlushesUnterminatedPartialLine")
+	if err != nil {
+		t.Fatalf("unable to create temp file")
+	}
+	t.Cleanup(func() {
+		if err := file.Close(); err != nil {
+			t.Logf("failed to close file: %v", err)
+		}
+		if err := os.Remove(file.Name()); err != nil {
+			t.Logf("failed to remove file: %v", err)
+		}
+	})
+	// The line is never terminated: no F record follows the P record.
+	file.WriteString("2026-10-01T14:27:54.313682300+00:00 stdout P stdout partial\n")
+
+	containerID := "fake-container-id"
+	fakeRuntimeService := &apitesting.FakeRuntimeService{
+		Containers: map[string]*apitesting.FakeContainer{
+			containerID: {
+				ContainerStatus: runtimeapi.ContainerStatus{
+					State: runtimeapi.ContainerState_CONTAINER_RUNNING,
+				},
+			},
+		},
+	}
+	buf := bytes.NewBuffer(nil)
+	err = ReadLogs(context.TODO(), file.Name(), containerID, &LogOptions{}, fakeRuntimeService, buf, buf)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if actual := buf.String(); actual != "stdout partial" {
+		t.Fatalf("Actual output does not match expected.\nActual:  %v\nExpected: stdout partial\n", actual)
+	}
+}
+
+func TestReadLogsLimitBytesWithPendingPartial(t *testing.T) {
+	file, err := os.CreateTemp("", "TestReadLogsLimitBytesWithPendingPartial")
+	if err != nil {
+		t.Fatalf("unable to create temp file")
+	}
+	t.Cleanup(func() {
+		if err := file.Close(); err != nil {
+			t.Logf("failed to close file: %v", err)
+		}
+		if err := os.Remove(file.Name()); err != nil {
+			t.Logf("failed to remove file: %v", err)
+		}
+	})
+	// The stdout fragment is buffered when the stderr line exhausts the
+	// byte limit: a completed line fills the remaining budget, and the
+	// never-terminated fragment is truncated away, like any content
+	// beyond the limit.
+	file.WriteString("2026-10-01T14:27:54.313682300+00:00 stdout P out-frag\n")
+	file.WriteString("2026-10-01T14:27:54.814408510+00:00 stderr F err-line\n")
+
+	containerID := "fake-container-id"
+	fakeRuntimeService := &apitesting.FakeRuntimeService{
+		Containers: map[string]*apitesting.FakeContainer{
+			containerID: {
+				ContainerStatus: runtimeapi.ContainerStatus{
+					State: runtimeapi.ContainerState_CONTAINER_RUNNING,
+				},
+			},
+		},
+	}
+	buf := bytes.NewBuffer(nil)
+	opts := LogOptions{LimitBytes: ptr.To(int64(8))}
+	err = ReadLogs(context.TODO(), file.Name(), containerID, &opts, fakeRuntimeService, buf, buf)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if actual := buf.String(); actual != "err-line" {
+		t.Fatalf("Actual output does not match expected.\nActual:  %v\nExpected: err-line\n", actual)
+	}
+}
+
 func TestReadRotatedLog(t *testing.T) {
 	tmpDir := t.TempDir()
 	file, err := os.CreateTemp(tmpDir, "logfile")
@@ -377,7 +517,7 @@ func TestWriteLogs(t *testing.T) {
 		stdoutBuf := bytes.NewBuffer(nil)
 		stderrBuf := bytes.NewBuffer(nil)
 		w := newLogWriter(stdoutBuf, stderrBuf, &LogOptions{Since: test.since, Timestamp: test.timestamp})
-		err := w.write(msg, true)
+		err := w.write(msg)
 		assert.NoError(t, err)
 		assert.Equal(t, test.expectStdout, stdoutBuf.String())
 		assert.Equal(t, test.expectStderr, stderrBuf.String())
@@ -441,13 +581,13 @@ func TestWriteLogsWithBytesLimit(t *testing.T) {
 		w := newLogWriter(stdoutBuf, stderrBuf, &LogOptions{Timestamp: test.timestamp, LimitBytes: ptr.To(int64(test.bytes))})
 		for i := 0; i < test.stdoutLines; i++ {
 			msg.stream = runtimeapi.Stdout
-			if err := w.write(msg, true); err != nil {
+			if err := w.write(msg); err != nil {
 				assert.EqualError(t, err, errMaximumWrite.Error())
 			}
 		}
 		for i := 0; i < test.stderrLines; i++ {
 			msg.stream = runtimeapi.Stderr
-			if err := w.write(msg, true); err != nil {
+			if err := w.write(msg); err != nil {
 				assert.EqualError(t, err, errMaximumWrite.Error())
 			}
 		}
@@ -555,7 +695,7 @@ func TestOnlyStdoutStream(t *testing.T) {
 				LimitBytes: bytesPtr,
 			})
 			for _, msg := range msgs {
-				err := w.write(msg, false)
+				err := w.write(msg)
 				if errors.Is(err, errMaximumWrite) {
 					continue
 				}
